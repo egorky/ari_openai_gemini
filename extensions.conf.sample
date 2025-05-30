@@ -1,0 +1,26 @@
+; extensions.conf - Asterisk dialplan configuration
+; This file defines call routing for extensions 200, 300, and 3000
+
+[internal]
+; Context for internal calls (used by extensions 200 and 300)
+
+; Extension 200: Allows calling extension 200 (e.g., from 300 or itself)
+exten => 200,1,NoOp(Calling extension 200)          ; Log a message for debugging
+exten => 200,n,Set(VOLUME(RX)=1)                    ; Set received volume to maximum (1)
+exten => 200,n,Set(VOLUME(TX)=1)                    ; Set transmitted volume to maximum (1)
+exten => 200,n,Dial(PJSIP/200,20,)                  ; Dial the PJSIP/200 endpoint for 20 seconds
+exten => 200,n,Hangup()                             ; Hang up the call if no answer or after completion
+
+; Extension 300: Allows calling extension 300 (e.g., from 200 or itself)
+exten => 300,1,NoOp(Calling extension 300)          ; Log a message for debugging
+exten => 300,n,Set(VOLUME(RX)=1)                    ; Set received volume to maximum (1)
+exten => 300,n,Set(VOLUME(TX)=1)                    ; Set transmitted volume to maximum (1)
+exten => 300,n,Dial(PJSIP/300,20,)                  ; Dial the PJSIP/300 endpoint for 20 seconds
+exten => 300,n,Hangup()                             ; Hang up the call if no answer or after completion
+
+; Extension 3000: Triggers the ARI application for OpenAI integration
+exten => 3000,1,NoOp(Calling ARI application for extension 3000)  ; Log a message for debugging
+exten => 3000,n,Set(VOLUME(RX)=1)                   ; Set received volume to maximum (1)
+exten => 3000,n,Set(VOLUME(TX)=1)                   ; Set transmitted volume to maximum (1)
+exten => 3000,n,Stasis(stasis_app)                  ; Send the call to the 'stasis_app' ARI application
+exten => 3000,n,Hangup()                            ; Hang up when Stasis ends

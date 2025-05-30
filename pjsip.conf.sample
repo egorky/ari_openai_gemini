@@ -1,0 +1,56 @@
+; pjsip.conf - PJSIP configuration for SIP endpoints
+; Defines transport and SIP users/extensions 200 and 300
+
+;------------------------------------------------------------
+; Transport configuration (basic UDP setup)
+;------------------------------------------------------------
+[transport-udp]
+type=transport                              ; Define a transport section
+protocol=udp                                ; Use UDP protocol for SIP
+bind=0.0.0.0                                ; Bind to all interfaces on default port (5060)
+
+;------------------------------------------------------------
+; Extension 200 - SIP endpoint configuration
+;------------------------------------------------------------
+[200]
+type=endpoint                               ; Define an endpoint for extension 200
+context=internal                            ; Context for incoming calls (matches extensions.conf)
+disallow=all                                ; Disallow all codecs by default
+allow=ulaw                                  ; Allow μ-law codec (required for OpenAI integration)
+auth=200                                    ; Link to authentication section
+aors=200                                    ; Link to address of record section
+direct_media=no                             ; Disable direct media (force Asterisk to handle RTP)
+media_use_received_transport=yes            ; Use the same transport for media as received
+
+[200]
+type=auth                                   ; Authentication section for extension 200
+auth_type=userpass                          ; Use username/password authentication
+password=pass200                            ; Password for extension 200 (change for security)
+username=200                                ; Username for extension 200
+
+[200]
+type=aor                                    ; Address of record for extension 200
+max_contacts=2                              ; Allow up to 2 simultaneous registrations (e.g., multiple devices)
+
+;------------------------------------------------------------
+; Extension 300 - SIP endpoint configuration
+;------------------------------------------------------------
+[300]
+type=endpoint                               ; Define an endpoint for extension 300
+context=internal                            ; Context for incoming calls (matches extensions.conf)
+disallow=all                                ; Disallow all codecs by default
+allow=ulaw                                  ; Allow μ-law codec (required for OpenAI integration)
+auth=300                                    ; Link to authentication section
+aors=300                                    ; Link to address of record section
+direct_media=no                             ; Disable direct media (force Asterisk to handle RTP)
+media_use_received_transport=yes            ; Use the same transport for media as received
+
+[300]
+type=auth                                   ; Authentication section for extension 300
+auth_type=userpass                          ; Use username/password authentication
+password=pass300                            ; Password for extension 300 (change for security)
+username=300                                ; Username for extension 300
+
+[300]
+type=aor                                    ; Address of record for extension 300
+max_contacts=2                              ; Allow up to 2 simultaneous registrations (e.g., multiple devices)
