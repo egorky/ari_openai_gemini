@@ -16,6 +16,8 @@ class GeminiApiCommunicator {
         this.ws = null;
         this.sessionReady = false;
         this.callSpecificData = null;
+        this.initialPromptText = null;
+        this.conversationHistory = []; // Initialize conversation history
 
         this._handleOpen = this._handleOpen.bind(this);
         this._handleMessage = this._handleMessage.bind(this);
@@ -23,9 +25,9 @@ class GeminiApiCommunicator {
         this._handleClose = this._handleClose.bind(this);
     }
 
-    _createBidiGenerateContentSetup(modelName) {
-        return {
-            model: modelName,
+    _buildBidiGenerateContentSetup() { // Renamed and will use instance variables
+        const setup = {
+            model: this.modelName, // Assuming modelName is stored in `this` from connect
             generationConfig: {
                 responseModalities: ["AUDIO", "TEXT"]
             },
@@ -42,15 +44,43 @@ class GeminiApiCommunicator {
             },
             inputAudioTranscription: {},
             outputAudioTranscription: {},
+            initialContents: null, // Will be populated if history or prompt exists
         };
+
+        const contents = [];
+        if (this.initialPromptText) {
+            contents.push({
+                role: "user", // Gemini often uses the first user message for system-like instructions
+                parts: [{ text: this.initialPromptText }]
+            });
+        }
+
+        if (this.conversationHistory && this.conversationHistory.length > 0) {
+            this.conversationHistory.forEach(message => {
+                contents.push({
+                    role: message.speaker === 'user' ? 'user' : 'model',
+                    parts: [{ text: message.text }]
+                });
+            });
+        }
+
+        if (contents.length > 0) {
+            setup.initialContents = { contents };
+        }
+        // console.log('[GeminiApiCommunicator] Constructed setup message with initialContents:', JSON.stringify(setup.initialContents, null, 2));
+        return setup;
     }
 
-    async connect(apiKey = null, modelName = GEMINI_MODEL_NAME, callSpecificData = {}) {
+    async connect(apiKey = null, modelName = GEMINI_MODEL_NAME, callSpecificData = {}, initialPrompt = null, initialHistory = []) {
         console.log(`[GeminiApiCommunicator] Attempting to connect for model: ${modelName}`);
+        this.modelName = modelName; // Store modelName
         this.callSpecificData = callSpecificData;
+        this.initialPromptText = initialPrompt;
+        this.conversationHistory = initialHistory || []; // Store initial history
         this.sessionReady = false;
+        // this.initialPromptSent is no longer needed as prompt is part of setup
 
-        const setup = this._createBidiGenerateContentSetup(modelName);
+        const setup = this._buildBidiGenerateContentSetup(); // Uses instance variables
 
         try {
             const { GoogleAuth } = require('google-auth-library');
@@ -114,7 +144,9 @@ class GeminiApiCommunicator {
             const message = JSON.parse(messageData.toString());
             if (message.setupComplete) {
                 this.sessionReady = true;
-                console.log("[GeminiApiCommunicator] Session setup complete. Ready to send audio.");
+                console.log("[GeminiApiCommunicator] Session setup complete and ready to send audio.");
+                // Initial prompt and history are now sent via BidiGenerateContentSetup,
+                // so no separate prompt sending logic is needed here.
                 if (this.callbacks.onSetupComplete) {
                     this.callbacks.onSetupComplete(this.callSpecificData);
                 }

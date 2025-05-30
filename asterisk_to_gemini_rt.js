@@ -9,6 +9,8 @@ require('dotenv').config();
 const { GoogleAuth } = require('google-auth-library');
 const https = require('https'); // Used by getGeminiEphemeralToken
 const WaveFile = require('wavefile').WaveFile;
+const prompts = require('./prompts'); // Added prompts
+const redisClient = require('./redis_manager'); // Import Redis client
 
 const GeminiApiCommunicator = require('./gemini_api_communicator');
 const getGeminiEphemeralToken = require('./get_gemini_ephemeral_token.js');
@@ -26,10 +28,13 @@ const GEMINI_TARGET_INPUT_SAMPLE_RATE = parseInt(process.env.GEMINI_TARGET_INPUT
 
 // VAD parameters for Gemini (from environment or defaults)
 const GEMINI_VAD_ENERGY_THRESHOLD = parseFloat(process.env.GEMINI_VAD_ENERGY_THRESHOLD) || -60;
-const GEMINI_VAD_PREFIX_PADDING_MS = parseInt(process.env.GEMINI_VAD_PREFIX_PADDING_MS) || 200; // Conceptual, maps to prefixRequiredDurationMs
-const GEMINI_VAD_END_SENSITIVITY = parseFloat(process.env.GEMINI_VAD_END_SENSITIVITY) || 0.8; // Conceptual, maps to activityRatioThreshold
-const GEMINI_VAD_SILENCE_DURATION_MS = parseInt(process.env.GEMINI_VAD_SILENCE_DURATION_MS) || 800; // Conceptual, maps to suffixRequiredDurationMs
+const GEMINI_VAD_PREFIX_PADDING_MS = parseInt(process.env.GEMINI_VAD_PREFIX_PADDING_MS) || 200;
+const GEMINI_VAD_END_SENSITIVITY = parseFloat(process.env.GEMINI_VAD_END_SENSITIVITY) || 0.8;
+const GEMINI_VAD_SILENCE_DURATION_MS = parseInt(process.env.GEMINI_VAD_SILENCE_DURATION_MS) || 800;
 
+// Redis Conversation TTL and History Max Turns
+const REDIS_CONVERSATION_TTL_S = parseInt(process.env.REDIS_CONVERSATION_TTL_S, 10) || 86400; // 24 hours
+const GEMINI_HISTORY_MAX_TURNS = parseInt(process.env.GEMINI_HISTORY_MAX_TURNS, 10) || 10; // Max 10 turns (user + ai)
 
 const RTP_PORT = parseInt(process.env.RTP_SERVER_PORT) || 12000;
 const MAX_CALL_DURATION_S = parseInt(process.env.MAX_CALL_DURATION_S) || 300; // Max call duration in seconds
@@ -402,8 +407,42 @@ rtpReceiver.on('message', (msg, rinfo) => {
                     logger.warn(`[Gemini] No active stream handler for channel ${csd.channelId} to send audio.`);
                 }
             },
-            onInputTranscription: (text, csd) => logger.info(`[Gemini] Input transcription for ${csd.channelId}: ${text}`),
-            onOutputTranscription: (text, csd) => logger.info(`[Gemini] Output transcription for ${csd.channelId}: ${text}`),
+            onInputTranscription: async (text, csd) => {
+                logger.info(`[Gemini] Input transcription for ${csd.channelId}: ${text}`);
+                if (text) {
+                    const userMessage = { speaker: "user", text: text, timestamp: Date.now() };
+                    const redisKey = `conv:${csd.channelId}`;
+                    try {
+                        if (redisClient && redisClient.isReady) {
+                            await redisClient.rPush(redisKey, JSON.stringify(userMessage));
+                            await redisClient.expire(redisKey, REDIS_CONVERSATION_TTL_S);
+                            logger.debug(`[Redis] Stored user message for ${csd.channelId}`);
+                        } else {
+                            logger.warn(`[Redis] Client not ready, cannot store user message for ${csd.channelId}`);
+                        }
+                    } catch (err) {
+                        logger.error(`[Redis] Error storing user message for ${csd.channelId}: ${err.message}`);
+                    }
+                }
+            },
+            onOutputTranscription: async (text, csd) => {
+                logger.info(`[Gemini] Output transcription for ${csd.channelId}: ${text}`);
+                if (text) {
+                    const aiMessage = { speaker: "ai", text: text, timestamp: Date.now() };
+                    const redisKey = `conv:${csd.channelId}`;
+                    try {
+                        if (redisClient && redisClient.isReady) {
+                            await redisClient.rPush(redisKey, JSON.stringify(aiMessage));
+                            await redisClient.expire(redisKey, REDIS_CONVERSATION_TTL_S);
+                            logger.debug(`[Redis] Stored AI message for ${csd.channelId}`);
+                        } else {
+                            logger.warn(`[Redis] Client not ready, cannot store AI message for ${csd.channelId}`);
+                        }
+                    } catch (err) {
+                        logger.error(`[Redis] Error storing AI message for ${csd.channelId}: ${err.message}`);
+                    }
+                }
+            },
             onConnectionClose: async (csd, code, reason) => {
                 logger.info(`[Gemini] Connection closed for ${csd.channelId}. Code: ${code}, Reason: ${reason}`);
                 const chData = sipMap.get(csd.channelId);
@@ -437,8 +476,30 @@ rtpReceiver.on('message', (msg, rinfo) => {
         };
 
         const ephemeralToken = await getGeminiEphemeralToken(GEMINI_PROJECT_ID, GEMINI_MODEL_NAME, bidiGenerateContentSetup, googleAuth);
-        await aiCommunicator.connect(null, GEMINI_MODEL_NAME, { ...callSpecificData, token: ephemeralToken }); // Pass token
-        logger.info(`[Gemini] Connection initiated for channel ${channel.id}.`);
+        const geminiSystemPrompt = prompts.gemini.system_instruction; // Get prompt
+        
+        let conversationHistory = [];
+        const redisKey = `conv:${channel.id}`;
+        try {
+            if (redisClient && redisClient.isReady) {
+                const historyJson = await redisClient.lRange(redisKey, -GEMINI_HISTORY_MAX_TURNS, -1);
+                conversationHistory = historyJson.map(item => JSON.parse(item));
+                logger.info(`[Redis] Retrieved ${conversationHistory.length} messages for channel ${channel.id}`);
+            } else {
+                logger.warn(`[Redis] Client not ready, cannot retrieve history for ${channel.id}`);
+            }
+        } catch (err) {
+            logger.error(`[Redis] Error retrieving history for ${channel.id}: ${err.message}`);
+        }
+        
+        await aiCommunicator.connect(
+            null, 
+            GEMINI_MODEL_NAME, 
+            { ...callSpecificData, token: ephemeralToken }, 
+            geminiSystemPrompt,
+            conversationHistory // Pass retrieved history
+        ); 
+        logger.info(`[Gemini] Connection initiated for channel ${channel.id} with prompt and history.`);
 
       } catch (e) {
         logger.error(`Error in StasisStart for channel ${channel.id}: ${e.message} - ${e.stack}`);
