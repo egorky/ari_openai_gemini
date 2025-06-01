@@ -26,11 +26,13 @@ const GEMINI_PROJECT_ID = process.env.GEMINI_PROJECT_ID;
 const GEMINI_MODEL_NAME = process.env.GEMINI_MODEL_NAME || 'models/gemini-1.5-flash-001';
 const GEMINI_TARGET_INPUT_SAMPLE_RATE = parseInt(process.env.GEMINI_TARGET_INPUT_SAMPLE_RATE) || 16000;
 
-// VAD parameters for Gemini (from environment or defaults)
-const GEMINI_VAD_ENERGY_THRESHOLD = parseFloat(process.env.GEMINI_VAD_ENERGY_THRESHOLD) || -60;
-const GEMINI_VAD_PREFIX_PADDING_MS = parseInt(process.env.GEMINI_VAD_PREFIX_PADDING_MS) || 200;
-const GEMINI_VAD_END_SENSITIVITY = parseFloat(process.env.GEMINI_VAD_END_SENSITIVITY) || 0.8;
-const GEMINI_VAD_SILENCE_DURATION_MS = parseInt(process.env.GEMINI_VAD_SILENCE_DURATION_MS) || 800;
+// VAD parameters for Gemini are primarily managed within GeminiApiCommunicator.js,
+// sourced from environment variables like GEMINI_VAD_ENERGY_THRESHOLD, etc.
+// These constants here are for reference or if direct use within this file was intended previously.
+// const GEMINI_VAD_ENERGY_THRESHOLD = parseFloat(process.env.GEMINI_VAD_ENERGY_THRESHOLD) || -60; // Example, actual is in communicator
+// const GEMINI_VAD_PREFIX_PADDING_MS = parseInt(process.env.GEMINI_VAD_PREFIX_PADDING_MS) || 200; // Example, actual is in communicator
+// const GEMINI_VAD_SILENCE_DURATION_MS = parseInt(process.env.GEMINI_VAD_SILENCE_DURATION_MS) || 800; // Example, actual is in communicator
+// GEMINI_VAD_END_SENSITIVITY was found to be unused and likely a typo for GEMINI_VAD_ACTIVITY_RATIO_THRESHOLD which is in the communicator.
 
 // Redis Conversation TTL and History Max Turns
 const REDIS_CONVERSATION_TTL_S = parseInt(process.env.REDIS_CONVERSATION_TTL_S, 10) || 86400; // 24 hours
@@ -138,16 +140,12 @@ function processInputAudioForGemini(muLawBuffer, channelId) {
     wav.fromScratch(1, GEMINI_TARGET_INPUT_SAMPLE_RATE, '16', pcm16kHz); // 1 channel, 16kHz, 16-bit
     const wavBuffer = wav.toBuffer();
     
-    // GeminiApiCommunicator expects a raw buffer (it will base64 encode internally)
-    // However, the prompt asked for base64 here. Let's stick to the prompt for now.
-    const base64Wav = wavBuffer.toString('base64');
-
     if (ENABLE_AUDIO_RECORDING && wavBuffer.length > 0) {
         if (!audioToServiceMap.has(channelId)) audioToServiceMap.set(channelId, []);
         audioToServiceMap.get(channelId).push({type: 'wav-input', data: wavBuffer});
     }
-    // logger.debug(`[AudioProc] Processed for Gemini (WAV base64): ${muLawBuffer.length} µ-law bytes -> ${base64Wav.length} base64 chars for channel ${channelId}`);
-    return base64Wav; // Return base64 encoded WAV string
+    // logger.debug(`[AudioProc] Processed for Gemini (WAV buffer): ${muLawBuffer.length} µ-law bytes -> ${wavBuffer.length} WAV bytes for channel ${channelId}`);
+    return wavBuffer; // Return raw WAV buffer
 }
 
 // Resample 24kHz LPCM to 8kHz LPCM (simple decimation: take 1 of every 3 samples)
@@ -329,10 +327,11 @@ async function streamAudio(channelId, rtpSource) {
         const channelDataForSipMap = {
             bridge: bridge,
             aiCommunicator: null,
-            streamHandler: null, 
+            streamHandler: null,
             rtpSource: null,
             geminiSessionReady: false,
             sendTimeout: null,
+            currentState: 'greeting', // MODIFIED: Initialize currentState
         };
         sipMap.set(channel.id, channelDataForSipMap);
 
@@ -372,8 +371,8 @@ rtpReceiver.on('message', (msg, rinfo) => {
   if (!chData.aiCommunicator || !chData.aiCommunicator.isReady()) return;
 
   try {
-    const base64Audio = processInputAudioForGemini(msg, channelId);
-    const wavBuffer = Buffer.from(base64Audio, 'base64');
+    const wavBuffer = processInputAudioForGemini(msg, channelId); // Now returns raw WAV buffer
+    // const wavBuffer = Buffer.from(base64Audio, 'base64'); // This line is no longer needed
     chData.aiCommunicator.sendAudio(wavBuffer);
   } catch (err) {
     logger.error(`[RTP->Gemini] Error processing audio for channel ${channelId}: ${err.message}`);
@@ -410,15 +409,21 @@ rtpReceiver.on('message', (msg, rinfo) => {
             onInputTranscription: async (text, csd) => {
                 logger.info(`[Gemini] Input transcription for ${csd.channelId}: ${text}`);
                 if (text) {
-                    const userMessage = { speaker: "user", text: text, timestamp: Date.now() };
+                    const chData = sipMap.get(csd.channelId);
+                    if (!chData) {
+                        logger.error(`[Redis] No chData found for ${csd.channelId} when storing user message.`);
+                        return;
+                    }
+                    // Include the current conversation state when saving the user's message to Redis.
+                    const userMessage = { speaker: "user", text: text, timestamp: Date.now(), state: chData.currentState };
                     const redisKey = `conv:${csd.channelId}`;
                     try {
                         if (redisClient && redisClient.isReady) {
                             await redisClient.rPush(redisKey, JSON.stringify(userMessage));
                             await redisClient.expire(redisKey, REDIS_CONVERSATION_TTL_S);
-                            logger.debug(`[Redis] Stored user message for ${csd.channelId}`);
+                            logger.debug(`[Redis] Stored user message for ${csd.channelId} with state ${chData.currentState}`);
                         } else {
-                            logger.warn(`[Redis] Client not ready, cannot store user message for ${csd.channelId}`);
+                            logger.warn(`[Redis] Client not ready, cannot store user message for ${csd.channelId} with state ${chData.currentState}`);
                         }
                     } catch (err) {
                         logger.error(`[Redis] Error storing user message for ${csd.channelId}: ${err.message}`);
@@ -428,15 +433,22 @@ rtpReceiver.on('message', (msg, rinfo) => {
             onOutputTranscription: async (text, csd) => {
                 logger.info(`[Gemini] Output transcription for ${csd.channelId}: ${text}`);
                 if (text) {
-                    const aiMessage = { speaker: "ai", text: text, timestamp: Date.now() };
+                    const chData = sipMap.get(csd.channelId);
+                    if (!chData) {
+                        logger.error(`[Redis] No chData found for ${csd.channelId} when storing AI message.`);
+                        return;
+                    }
+                    // Include the current conversation state when saving the AI's message to Redis.
+                    // This reflects the state that was active when this AI response was generated/received.
+                    const aiMessage = { speaker: "ai", text: text, timestamp: Date.now(), state: chData.currentState };
                     const redisKey = `conv:${csd.channelId}`;
                     try {
                         if (redisClient && redisClient.isReady) {
                             await redisClient.rPush(redisKey, JSON.stringify(aiMessage));
                             await redisClient.expire(redisKey, REDIS_CONVERSATION_TTL_S);
-                            logger.debug(`[Redis] Stored AI message for ${csd.channelId}`);
+                            logger.debug(`[Redis] Stored AI message for ${csd.channelId} with state ${chData.currentState}`);
                         } else {
-                            logger.warn(`[Redis] Client not ready, cannot store AI message for ${csd.channelId}`);
+                            logger.warn(`[Redis] Client not ready, cannot store AI message for ${csd.channelId} with state ${chData.currentState}`);
                         }
                     } catch (err) {
                         logger.error(`[Redis] Error storing AI message for ${csd.channelId}: ${err.message}`);
@@ -467,39 +479,80 @@ rtpReceiver.on('message', (msg, rinfo) => {
         });
         channelDataForSipMap.aiCommunicator = aiCommunicator;
 
-        const bidiGenerateContentSetup = aiCommunicator._createBidiGenerateContentSetup(GEMINI_MODEL_NAME);
-        bidiGenerateContentSetup.realtimeInputConfig.automaticActivityDetection.vadTuningConfig = {
-            activityRatioThreshold: VAD_ACTIVITY_RATIO_THRESHOLD,
-            energyThreshold: VAD_ENERGY_THRESHOLD,
-            prefixRequiredDurationMs: VAD_PREFIX_REQUIRED_DURATION_MS,
-            suffixRequiredDurationMs: VAD_SUFFIX_REQUIRED_DURATION_MS,
-        };
+        // const bidiGenerateContentSetup = aiCommunicator._createBidiGenerateContentSetup(GEMINI_MODEL_NAME);
+        // bidiGenerateContentSetup.realtimeInputConfig.automaticActivityDetection.vadTuningConfig = {
+        //     activityRatioThreshold: VAD_ACTIVITY_RATIO_THRESHOLD, // These seem to be undefined VAD variables
+        //     energyThreshold: VAD_ENERGY_THRESHOLD, // These VAD values are now set within GeminiApiCommunicator
+        //     prefixRequiredDurationMs: VAD_PREFIX_REQUIRED_DURATION_MS,
+        //     suffixRequiredDurationMs: VAD_SUFFIX_REQUIRED_DURATION_MS,
+        // };
+        // The BidiGenerateContentSetup, including VAD parameters, is now constructed internally by GeminiApiCommunicator.connect
 
-        const ephemeralToken = await getGeminiEphemeralToken(GEMINI_PROJECT_ID, GEMINI_MODEL_NAME, bidiGenerateContentSetup, googleAuth);
-        const geminiSystemPrompt = prompts.gemini.system_instruction; // Get prompt
+        // Retrieve the general system instruction for Gemini.
+        const systemInitialPrompt = prompts.gemini.system_instruction;
         
+        // --- Determine Current Conversation State and Load History ---
+        // Default to 'greeting' state if no history or state is found.
+        let currentConversationState = 'greeting';
         let conversationHistory = [];
         const redisKey = `conv:${channel.id}`;
+
         try {
             if (redisClient && redisClient.isReady) {
+                // Retrieve the last N turns of conversation history from Redis.
                 const historyJson = await redisClient.lRange(redisKey, -GEMINI_HISTORY_MAX_TURNS, -1);
-                conversationHistory = historyJson.map(item => JSON.parse(item));
+                if (historyJson && historyJson.length > 0) {
+                    conversationHistory = historyJson.map(item => JSON.parse(item));
+                    // Check the last message in the history for a recorded state.
+                    const lastMessage = conversationHistory[conversationHistory.length - 1];
+                    if (lastMessage && lastMessage.state) {
+                        currentConversationState = lastMessage.state;
+                        logger.info(`[State] Retrieved last known state for ${channel.id}: ${currentConversationState}`);
+                    } else {
+                        // If no state in the last message, default to 'greeting'.
+                        logger.info(`[State] No state found in last message for ${channel.id}, defaulting to 'greeting'.`);
+                    }
+                } else {
+                    logger.info(`[Redis] No conversation history found for ${channel.id}, starting with 'greeting' state.`);
+                }
                 logger.info(`[Redis] Retrieved ${conversationHistory.length} messages for channel ${channel.id}`);
             } else {
-                logger.warn(`[Redis] Client not ready, cannot retrieve history for ${channel.id}`);
+                logger.warn(`[Redis] Client not ready, cannot retrieve history for ${channel.id}. Starting with 'greeting' state.`);
             }
         } catch (err) {
-            logger.error(`[Redis] Error retrieving history for ${channel.id}: ${err.message}`);
+            logger.error(`[Redis] Error retrieving history for ${channel.id}: ${err.message}. Defaulting to 'greeting' state.`);
         }
+
+        // Ensure the channelData in sipMap reflects the determined currentConversationState.
+        // This is important because chData.currentState is used elsewhere (e.g., in transcription callbacks).
+        const chData = sipMap.get(channel.id);
+        if (chData) {
+            chData.currentState = currentConversationState;
+        } else {
+            // This should ideally not happen if StasisStart logic is correct.
+            logger.error(`[State] CRITICAL: sipMap entry missing for ${channel.id} before Gemini connect. State might be incorrect.`);
+        }
+
+        // Select the state-specific prompt based on the determined currentConversationState.
+        // Fallback to a generic prompt if the state is unrecognized.
+        const currentPromptForState = prompts.gemini.states[currentConversationState] || prompts.gemini.states.fallback;
+        logger.info(`[State] Initializing call ${channel.id} with state: ${currentConversationState}. Using prompt: "${currentPromptForState.substring(0, 50)}..."`);
+
+        // The ephemeralToken is obtained internally by GeminiApiCommunicator.connect.
+        // callSpecificData should contain any necessary info for token generation if it were handled here,
+        // but it's now encapsulated within the communicator.
         
+        // Connect to Gemini, passing the system prompt, state-specific prompt, history, and current state.
         await aiCommunicator.connect(
-            null, 
-            GEMINI_MODEL_NAME, 
-            { ...callSpecificData, token: ephemeralToken }, 
-            geminiSystemPrompt,
-            conversationHistory // Pass retrieved history
-        ); 
-        logger.info(`[Gemini] Connection initiated for channel ${channel.id} with prompt and history.`);
+            null, // apiKey - not used by this version of GeminiApiCommunicator's connect
+            GEMINI_MODEL_NAME,
+            { ...callSpecificData }, // Contains channelId, bridgeId, rtpSource
+            systemInitialPrompt,     // Overall system instruction
+            currentPromptForState,   // Prompt specific to the current conversation state
+            conversationHistory,     // Recently retrieved conversation history
+            currentConversationState // The determined current state of the conversation
+        );
+        logger.info(`[Gemini] Connection initiated for channel ${channel.id} with system prompt, state prompt, history, and current state.`);
 
       } catch (e) {
         logger.error(`Error in StasisStart for channel ${channel.id}: ${e.message} - ${e.stack}`);

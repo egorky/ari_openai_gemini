@@ -9,6 +9,7 @@ const GEMINI_PROJECT_ID = process.env.GEMINI_PROJECT_ID;
 const VAD_THRESHOLD = parseFloat(process.env.GEMINI_VAD_ENERGY_THRESHOLD) || -60;
 const VAD_PREFIX_DURATION_MS = parseInt(process.env.GEMINI_VAD_PREFIX_PADDING_MS) || 200;
 const VAD_SILENCE_DURATION_MS = parseInt(process.env.GEMINI_VAD_SILENCE_DURATION_MS) || 800;
+const VAD_ACTIVITY_RATIO_THRESHOLD = parseFloat(process.env.GEMINI_VAD_ACTIVITY_RATIO_THRESHOLD) || 0.8;
 
 class GeminiApiCommunicator {
     constructor(callbacks) {
@@ -16,8 +17,10 @@ class GeminiApiCommunicator {
         this.ws = null;
         this.sessionReady = false;
         this.callSpecificData = null;
-        this.initialPromptText = null;
-        this.conversationHistory = []; // Initialize conversation history
+        this.initialSystemPrompt = null; // Renamed from initialPromptText
+        this.currentPromptForState = null;
+        this.conversationHistory = [];
+        this.currentState = 'greeting'; // Default state
 
         this._handleOpen = this._handleOpen.bind(this);
         this._handleMessage = this._handleMessage.bind(this);
@@ -34,7 +37,7 @@ class GeminiApiCommunicator {
             realtimeInputConfig: {
                 automaticActivityDetection: {
                     vadTuningConfig: {
-                        activityRatioThreshold: 0.8,
+                        activityRatioThreshold: VAD_ACTIVITY_RATIO_THRESHOLD,
                         energyThreshold: VAD_THRESHOLD,
                         prefixRequiredDurationMs: VAD_PREFIX_DURATION_MS,
                         suffixRequiredDurationMs: VAD_SILENCE_DURATION_MS,
@@ -48,13 +51,32 @@ class GeminiApiCommunicator {
         };
 
         const contents = [];
-        if (this.initialPromptText) {
+        let combinedInitialText = "";
+
+        // Combine the general system-level instruction with the more specific prompt for the current conversation state.
+        // This allows for a base behavior defined by initialSystemPrompt, augmented by context-specific instructions.
+        if (this.initialSystemPrompt) {
+            combinedInitialText += this.initialSystemPrompt;
+        }
+
+        if (this.currentPromptForState) {
+            if (combinedInitialText.length > 0) {
+                combinedInitialText += "\n\n"; // Add a visual separator if both prompts exist.
+            }
+            combinedInitialText += this.currentPromptForState;
+        }
+
+        // If there's any combined text from system/state prompts, add it as the first "user" turn.
+        // This sets the initial context for the Gemini model.
+        if (combinedInitialText.length > 0) {
             contents.push({
-                role: "user", // Gemini often uses the first user message for system-like instructions
-                parts: [{ text: this.initialPromptText }]
+                role: "user", // For Gemini, initial system-like instructions are often passed as the first user message.
+                parts: [{ text: combinedInitialText }]
             });
         }
 
+        // Append the existing conversation history after the initial system/state prompts.
+        // This provides the model with the preceding turns of the conversation.
         if (this.conversationHistory && this.conversationHistory.length > 0) {
             this.conversationHistory.forEach(message => {
                 contents.push({
@@ -71,14 +93,20 @@ class GeminiApiCommunicator {
         return setup;
     }
 
-    async connect(apiKey = null, modelName = GEMINI_MODEL_NAME, callSpecificData = {}, initialPrompt = null, initialHistory = []) {
-        console.log(`[GeminiApiCommunicator] Attempting to connect for model: ${modelName}`);
-        this.modelName = modelName; // Store modelName
+    async connect(apiKey = null, modelName = GEMINI_MODEL_NAME, callSpecificData = {}, initialSystemPrompt = null, currentPromptForState = null, initialHistory = [], currentConversationState = 'greeting') {
+        console.log(`[GeminiApiCommunicator] Attempting to connect for model: ${modelName}, state: ${currentConversationState}`);
+        this.modelName = modelName;
         this.callSpecificData = callSpecificData;
-        this.initialPromptText = initialPrompt;
-        this.conversationHistory = initialHistory || []; // Store initial history
+
+        // The overall system instruction defining the AI's role, persona, or general guidelines.
+        this.initialSystemPrompt = initialSystemPrompt;
+        // A specific prompt tailored to the current state of the conversation (e.g., greeting, gathering info).
+        this.currentPromptForState = currentPromptForState;
+        // History of previous turns in this conversation.
+        this.conversationHistory = initialHistory || [];
+        // The current state of the conversation (e.g., 'greeting', 'collecting_info').
+        this.currentState = currentConversationState;
         this.sessionReady = false;
-        // this.initialPromptSent is no longer needed as prompt is part of setup
 
         const setup = this._buildBidiGenerateContentSetup(); // Uses instance variables
 

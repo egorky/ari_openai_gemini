@@ -647,8 +647,66 @@ async function getGeminiEphemeralToken(bidiGenerateContentSetup) {
 
 
 // Start WebSocket connection or Gemini connection for the selected AI service
-async function startAiServiceSession(channelId, channelDataForSipMap) {
-  logger.info(`Attempting to start AI Service session for channel ${channelId} using ${AI_SERVICE_PROVIDER}`);
+async function startAiServiceSession(channelId, channelDataFromStasisStart) { // Renamed parameter
+  // It's crucial to get the most up-to-date channelData from sipMap,
+  // as other async operations (like rtpSource identification) might have modified it.
+  let channelDataForSipMap = sipMap.get(channelId);
+  if (!channelDataForSipMap) {
+    logger.error(`[State] CRITICAL: No channelDataForSipMap found for ${channelId} at start of startAiServiceSession. Using StasisStart data or defaulting.`);
+    // Fallback to the data passed from StasisStart if not found in map (should ideally not happen)
+    // or create a minimal default if even that is missing.
+    channelDataForSipMap = channelDataFromStasisStart || { channelId: channelId, currentState: 'greeting', bridge: null, rtpSource: null };
+    if (!channelDataFromStasisStart) {
+        logger.warn(`[State] channelDataFromStasisStart was also null for ${channelId}. Using emergency default state 'greeting'.`);
+    }
+    // If we had to fallback, ensure this temporary/emergency object is in sipMap for subsequent operations within this function.
+    // This is a recovery attempt, the root cause of missing sipMap entry should be investigated if it occurs.
+    if (!sipMap.has(channelId)) {
+        logger.warn(`[State] sipMap was missing ${channelId}, temporarily setting minimal data. This indicates a potential issue.`);
+        sipMap.set(channelId, channelDataForSipMap);
+    }
+  }
+
+  // --- Retrieve History and Determine State for OpenAI ---
+  // The initial `currentState` is set to 'greeting' when `channelDataForSipMap` is created.
+  // Here, we try to update it based on Redis history if available.
+  let currentConversationState = channelDataForSipMap.currentState || 'greeting'; // Fallback if somehow undefined
+  const redisKey = `conv:${channelId}`;
+  // OpenAI's Realtime API doesn't directly use conversation history in the `session.update` message,
+  // but we retrieve it here to determine the last known conversation state.
+  let conversationHistoryForStateDetermination = [];
+
+  try {
+    if (redisClient && redisClient.isReady) {
+      const historyJson = await redisClient.lRange(redisKey, -10, -1); // Get last 10 turns for state check
+      if (historyJson && historyJson.length > 0) {
+        conversationHistoryForStateDetermination = historyJson.map(item => JSON.parse(item));
+        const lastMessage = conversationHistoryForStateDetermination[conversationHistoryForStateDetermination.length - 1];
+        // If the last message in history has a 'state' property, use it.
+        if (lastMessage && lastMessage.state) {
+          currentConversationState = lastMessage.state;
+          logger.info(`[State] Retrieved last known state for OpenAI call ${channelId} from Redis: ${currentConversationState}`);
+        } else {
+          // If no state in last message, retain the existing state (e.g., 'greeting' for a new call).
+          logger.info(`[State] No state in last Redis message for OpenAI call ${channelId}, using current/initial state: ${currentConversationState}`);
+        }
+      } else {
+        // No history in Redis, so the current state (likely 'greeting') is appropriate.
+        logger.info(`[Redis] No conversation history found for OpenAI call ${channelId}, using current/initial state: ${currentConversationState}`);
+      }
+    } else {
+      logger.warn(`[Redis] Client not ready for OpenAI call ${channelId}, using current/initial state: ${currentConversationState}`);
+    }
+  } catch (err) {
+    logger.error(`[Redis] Error retrieving history for OpenAI call ${channelId}: ${err.message}. Using current/initial state: ${currentConversationState}`);
+  }
+
+  // Update the authoritative currentState in the sipMap for this channel.
+  channelDataForSipMap.currentState = currentConversationState;
+  logger.info(`[State] Initializing OpenAI call ${channelId} with state: ${currentConversationState}`);
+  // --- End Retrieve History and Determine State ---
+
+  logger.info(`Attempting to start AI Service session for channel ${channelId} using ${AI_SERVICE_PROVIDER} with state ${currentConversationState}`);
 
   let aiCommunicator = null;
   // streamHandler is for sending audio TO Asterisk. It's initialized after rtpSource is known.
@@ -816,12 +874,29 @@ async function startAiServiceSession(channelId, channelDataForSipMap) {
         if (chData && (!chData.streamHandler || !chData.streamHandler.isStreaming())) {
             await initializeAndAssignStreamHandler();
         }
+        const chDataForOpen = sipMap.get(channelId); // Fetch latest chData again
+        if (!chDataForOpen) {
+            logger.error(`[OpenAI] CRITICAL: No chData found for ${channelId} in ws.on('open'). Cannot set instructions.`);
+            // Consider closing the WS connection or using a very generic prompt
+            ws.close(1011, "Internal configuration error");
+            return;
+        }
+        // Retrieve the base system instruction for OpenAI.
+        const systemInitialPrompt = prompts.openai.system_instruction;
+        // Retrieve the state-specific prompt based on the current conversation state.
+        // Fallback to a generic fallback prompt if the current state is not defined in prompts.js.
+        const currentPromptForState = prompts.openai.states[chDataForOpen.currentState] || prompts.openai.states.fallback;
+        // Combine the system instruction and the state-specific prompt.
+        // This combined text will guide the AI's behavior for the current turn.
+        const combinedInstructions = systemInitialPrompt + "\n\n" + currentPromptForState;
+        logger.info(`[OpenAI] Using combined instructions for channel ${channelId} in state ${chDataForOpen.currentState}: "${combinedInstructions.substring(0,100)}..."`);
+
         ws.send(JSON.stringify({
             type: 'session.update',
             session: {
                 modalities: ['audio', 'text'],
                 voice: OPENAI_VOICE_ID,
-                instructions: prompts.openai.system_instruction,
+                instructions: combinedInstructions, // Send the combined instructions to OpenAI.
                 turn_detection: {
                     type: 'server_vad',
                     threshold: VAD_THRESHOLD,
@@ -852,15 +927,25 @@ async function startAiServiceSession(channelId, channelDataForSipMap) {
                     const userText = response.transcript.trim();
                     logServer(`[OpenAI] Input transcription for ${channelId}: "${userText}"`);
                     if (userText) {
-                        const userMessage = { speaker: "user", text: userText, timestamp: Date.now() };
+                        const chData = sipMap.get(channelId);
+                        if (!chData) {
+                            logger.error(`[Redis] No chData found for ${channelId} when storing user message (OpenAI).`);
+                        }
+                        // Include the current conversation state when saving the user's message to Redis.
+                        const userMessage = {
+                            speaker: "user",
+                            text: userText,
+                            timestamp: Date.now(),
+                            state: chData ? chData.currentState : 'unknown' // Fallback to 'unknown' if chData is missing
+                        };
                         const redisKey = `conv:${channelId}`;
                         try {
                             if (redisClient && redisClient.isReady) { // Check if client is connected
                                 await redisClient.rPush(redisKey, JSON.stringify(userMessage));
                                 await redisClient.expire(redisKey, REDIS_CONVERSATION_TTL_S);
-                                logger.debug(`[Redis] Stored user message for ${channelId}`);
+                                logger.debug(`[Redis] Stored user message for ${channelId} with state ${userMessage.state}`);
                             } else {
-                                logger.warn(`[Redis] Client not ready, cannot store user message for ${channelId}`);
+                                logger.warn(`[Redis] Client not ready, cannot store user message for ${channelId} with state ${userMessage.state}`);
                             }
                         } catch (err) {
                             logger.error(`[Redis] Error storing user message for ${channelId}: ${err.message}`);
@@ -891,15 +976,26 @@ async function startAiServiceSession(channelId, channelDataForSipMap) {
                     const aiText = response.transcript.trim();
                     logServer(`[OpenAI] Output transcription for ${channelId}: "${aiText}"`);
                     if (aiText) {
-                        const aiMessage = { speaker: "ai", text: aiText, timestamp: Date.now() };
+                        const chData = sipMap.get(channelId);
+                        if (!chData) {
+                            logger.error(`[Redis] No chData found for ${channelId} when storing AI message (OpenAI).`);
+                        }
+                        // Include the current conversation state when saving the AI's message to Redis.
+                        // This reflects the state that was active when this AI response was generated/received.
+                        const aiMessage = {
+                            speaker: "ai",
+                            text: aiText,
+                            timestamp: Date.now(),
+                            state: chData ? chData.currentState : 'unknown' // Fallback to 'unknown' if chData is missing
+                        };
                         const redisKey = `conv:${channelId}`;
                         try {
                             if (redisClient && redisClient.isReady) { // Check if client is connected
                                 await redisClient.rPush(redisKey, JSON.stringify(aiMessage));
                                 await redisClient.expire(redisKey, REDIS_CONVERSATION_TTL_S);
-                                logger.debug(`[Redis] Stored AI message for ${channelId}`);
+                                logger.debug(`[Redis] Stored AI message for ${channelId} with state ${aiMessage.state}`);
                             } else {
-                                logger.warn(`[Redis] Client not ready, cannot store AI message for ${channelId}`);
+                                logger.warn(`[Redis] Client not ready, cannot store AI message for ${channelId} with state ${aiMessage.state}`);
                             }
                         } catch (err) {
                             logger.error(`[Redis] Error storing AI message for ${channelId}: ${err.message}`);
@@ -1034,6 +1130,7 @@ async function startAiServiceSession(channelId, channelDataForSipMap) {
             aiCommunicator: null,
             streamHandler: null, // For sending audio TO Asterisk
             rtpSource: null,     // Info about where Asterisk is sending FROM
+            currentState: 'greeting', // MODIFIED: Initialize currentState
         };
         sipMap.set(channel.id, channelDataForSipMap);
 

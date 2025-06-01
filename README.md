@@ -37,6 +37,65 @@ This project connects Asterisk with OpenAI's real-time API to enable real-time v
    - Employs Winston for comprehensive logging.
 7. **Configuration**:
    - Settings are managed via `.env` file and `prompts.js`.
+8. **Stateful Conversation Management**:
+   - Implements a state machine to guide conversations, with prompts defined in `prompts.js`.
+
+## Conversation and Prompt Management
+
+This system implements a stateful conversation flow, allowing the AI's behavior and responses to be tailored to different stages of an interaction. This is managed through the `prompts.js` file.
+
+### `prompts.js` Structure
+
+The `prompts.js` file defines the initial system instructions and state-specific prompts for both OpenAI and Gemini integrations. Here's an example structure:
+
+```javascript
+// prompts.js
+module.exports = {
+    openai: {
+        system_instruction: "You are a helpful voice assistant scheduling appointments...",
+        states: {
+            greeting: "Hello! I'm here to help you schedule an appointment...",
+            gathering_reason: "Okay, and could you briefly tell me the reason for this appointment?",
+            // ... other states like collecting_availability_days, proposing_slot, etc.
+            confirmation: "Excellent! Your appointment for {reason} is confirmed...",
+            fallback: "I'm sorry, I didn't quite understand...",
+            error_handler: "I seem to be having some trouble..."
+        }
+    },
+    gemini: {
+        system_instruction: "You are a helpful AI assistant for scheduling appointments...",
+        states: {
+            greeting: "Hello! I'm an AI assistant, and I can help you schedule an appointment...",
+            gathering_reason: "Understood. And what is the primary reason for this appointment?",
+            // ... other states
+            confirmation: "Perfect! Your appointment for {reason} is set...",
+            fallback: "My apologies, I didn't catch that...",
+            error_handler: "Apologies, I'm encountering a technical issue..."
+        }
+    }
+};
+```
+
+### Key Components:
+
+*   `system_instruction`: This is the initial, general instruction given to the AI at the beginning of a session. It sets the overall context, persona, and objective for the AI. For OpenAI, this is part of the initial `session.update` message. For Gemini, this is the first part of the `initialContents` sent during connection setup.
+*   `states`: This object contains specific prompts for various conversational states. The application transitions through these states (though advanced state transition logic is managed within the application scripts, not `prompts.js` itself).
+    *   `greeting`: The initial message from the AI when a call starts.
+    *   `gathering_reason`: Prompt to ask for the purpose of the call/appointment.
+    *   Other states like `collecting_availability_days`, `collecting_availability_times`, `proposing_slot` guide the conversation flow for tasks like scheduling.
+    *   `confirmation`: Used when an action is successfully completed.
+    *   `fallback`: A generic response when the AI doesn't understand the user.
+    *   `error_handler`: A prompt for when the system encounters an internal error.
+
+### Customization
+
+You can customize the AI's behavior and conversational flow by:
+
+1.  **Modifying existing prompts** in `prompts.js` to change the AI's language or persona for each state.
+2.  **Adding new states** in `prompts.js` and updating the application logic (e.g., in `asterisk_to_openai_rt.js` or `asterisk_to_gemini_rt.js`) to use these new states and manage transitions between them.
+3.  Changing the `system_instruction` to alter the AI's core objective or constraints.
+
+The application dynamically combines the `system_instruction` with the prompt for the current state to guide the AI's responses. For instance, in the OpenAI integration, the `instructions` field of the `session.update` message becomes a combination of `system_instruction` and the current state's prompt. Similarly, for Gemini, these are combined in the initial user message.
 
 ## Prerequisites
 - **Node.js**: Version 16 or higher.
@@ -78,13 +137,14 @@ This project connects Asterisk with OpenAI's real-time API to enable real-time v
      - `REDIS_PASSWORD`: Password for Redis authentication (optional, default: none).
      - `REDIS_DB`: Redis database number (optional, default: 0).
      - `REDIS_CONVERSATION_TTL_S`: Time-to-live for conversation history in Redis, in seconds (default: 86400, i.e., 24 hours).
+     - Redis is also used to store the current conversation state alongside each message turn, allowing for better context tracking.
    - **Other**:
      - `MAX_CALL_DURATION_S`: (Optional, default: 300) Max call duration in seconds.
      - `LOG_LEVEL`: (Optional, e.g., `info`, `debug`)
      - VAD parameters (`VAD_THRESHOLD`, `VAD_PREFIX_PADDING_MS`, `VAD_SILENCE_DURATION_MS`).
 
 4. **System Prompts (`prompts.js`)**:
-   - Review and customize default system prompts in `prompts.js` if needed. Environment variables like `OPENAI_SYSTEM_INSTRUCTION` can override these.
+   - Review and customize default system prompts and state-specific prompts in `prompts.js`. The new "Conversation and Prompt Management" section provides more details.
 
 5. **Asterisk Setup**:
    - Ensure Asterisk is running and ARI is enabled.
@@ -112,4 +172,3 @@ This project connects Asterisk with OpenAI's real-time API to enable real-time v
 3. Make a call from your SIP client to an extension routed to your Stasis application.
 
 Use headphones for the best experience, as using speakers might cause echo and interrupt the AI's speech detection.
-[end of README.md]
