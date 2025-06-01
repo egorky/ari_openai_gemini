@@ -10,8 +10,10 @@ require('dotenv').config(); // Loads environment variables from .env file
 const { GoogleAuth } = require('google-auth-library'); // For Google Cloud authentication
 const https = require('https'); // For making HTTPS requests (Gemini token)
 const WaveFile = require('wavefile').WaveFile; // For WAV encoding
+const redisClient = require('./redis_manager'); // Import Redis client
 
 const GeminiApiCommunicator = require('./gemini_api_communicator'); // Import Gemini API Communicator
+const prompts = require('./prompts.js'); // Load prompts
 
 // Configuration constants loaded from environment variables or defaults
 const ARI_URL = process.env.ARI_URL || 'http://127.0.0.1:8088';
@@ -21,6 +23,9 @@ const ARI_APP = process.env.ARI_APP_NAME || 'openai-rt-app';
 
 // AI Service Provider ("openai" or "gemini")
 const AI_SERVICE_PROVIDER = (process.env.AI_SERVICE_PROVIDER || 'openai').toLowerCase();
+
+// Redis Conversation TTL
+const REDIS_CONVERSATION_TTL_S = parseInt(process.env.REDIS_CONVERSATION_TTL_S, 10) || 86400; // 24 hours
 
 // OpenAI API Configuration (Legacy or if AI_SERVICE_PROVIDER is "openai")
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
@@ -816,7 +821,7 @@ async function startAiServiceSession(channelId, channelDataForSipMap) {
             session: {
                 modalities: ['audio', 'text'],
                 voice: OPENAI_VOICE_ID,
-                instructions: 'Always respond with audio to any detected speech.',
+                instructions: prompts.openai.system_instruction,
                 turn_detection: {
                     type: 'server_vad',
                     threshold: VAD_THRESHOLD,
@@ -843,7 +848,25 @@ async function startAiServiceSession(channelId, channelDataForSipMap) {
                 audioSentTime = Date.now();
                 break;
             case 'conversation.item.input_audio_transcription.completed':
-                logServer(`[OpenAI] Input transcription for ${channelId}: "${response.transcript.trim()}"`);
+                {
+                    const userText = response.transcript.trim();
+                    logServer(`[OpenAI] Input transcription for ${channelId}: "${userText}"`);
+                    if (userText) {
+                        const userMessage = { speaker: "user", text: userText, timestamp: Date.now() };
+                        const redisKey = `conv:${channelId}`;
+                        try {
+                            if (redisClient && redisClient.isReady) { // Check if client is connected
+                                await redisClient.rPush(redisKey, JSON.stringify(userMessage));
+                                await redisClient.expire(redisKey, REDIS_CONVERSATION_TTL_S);
+                                logger.debug(`[Redis] Stored user message for ${channelId}`);
+                            } else {
+                                logger.warn(`[Redis] Client not ready, cannot store user message for ${channelId}`);
+                            }
+                        } catch (err) {
+                            logger.error(`[Redis] Error storing user message for ${channelId}: ${err.message}`);
+                        }
+                    }
+                }
                 break;
             case 'response.audio.delta':
                 audioDeltaCount++;
@@ -864,7 +887,25 @@ async function startAiServiceSession(channelId, channelDataForSipMap) {
                 transcriptDeltaCount++;
                 break;
             case 'response.audio_transcript.done':
-                logServer(`[OpenAI] Output transcription for ${channelId}: "${response.transcript.trim()}"`);
+                {
+                    const aiText = response.transcript.trim();
+                    logServer(`[OpenAI] Output transcription for ${channelId}: "${aiText}"`);
+                    if (aiText) {
+                        const aiMessage = { speaker: "ai", text: aiText, timestamp: Date.now() };
+                        const redisKey = `conv:${channelId}`;
+                        try {
+                            if (redisClient && redisClient.isReady) { // Check if client is connected
+                                await redisClient.rPush(redisKey, JSON.stringify(aiMessage));
+                                await redisClient.expire(redisKey, REDIS_CONVERSATION_TTL_S);
+                                logger.debug(`[Redis] Stored AI message for ${channelId}`);
+                            } else {
+                                logger.warn(`[Redis] Client not ready, cannot store AI message for ${channelId}`);
+                            }
+                        } catch (err) {
+                            logger.error(`[Redis] Error storing AI message for ${channelId}: ${err.message}`);
+                        }
+                    }
+                }
                 break;
             case 'response.done':
                 logServer(`[OpenAI] Response completed for ${channelId}. Audio deltas: ${audioDeltaCount}, Transcript deltas: ${transcriptDeltaCount}`);

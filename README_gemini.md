@@ -10,6 +10,9 @@ Key functionalities include:
 *   Receiving audio responses (as 24kHz PCM) and text transcriptions from Gemini.
 *   Processing and streaming Gemini's audio responses back to Asterisk via RTP.
 *   Secure authentication with Google Cloud and Gemini using service accounts and ephemeral tokens.
+*   Conversation memory using Redis to provide context from previous turns in the current call.
+
+For details on the OpenAI integration, please see `README.md`.
 
 ## Features
 
@@ -22,6 +25,9 @@ Key functionalities include:
     *   Handles ephemeral token authentication for secure API access.
     *   Manages session setup and real-time, bidirectional audio streaming.
     *   Receives and logs input and output transcriptions.
+*   **Conversation Memory (New)**:
+    *   Stores conversation history (user and AI turns) in Redis with a configurable TTL.
+    *   Loads a configurable number of recent conversation turns from Redis to provide context to Gemini at the beginning of a new call.
 *   **Configurable VAD:** Voice Activity Detection settings for Gemini can be configured via environment variables.
 *   **Detailed Logging:** Uses Winston for detailed and configurable logging.
 *   **Optional Audio Recording:** Can save incoming and outgoing audio streams for debugging and analysis (controlled by an environment variable).
@@ -30,6 +36,7 @@ Key functionalities include:
 
 *   **Node.js:** v16.x or newer recommended.
 *   **Asterisk:** v18.x or v20+ with ARI enabled.
+*   **Redis Server**: An instance of Redis (v4.x or later recommended) must be running and accessible for conversation memory.
 *   **Google Cloud Project:**
     *   Billing enabled.
     *   **Google Generative Language API** (`generativelanguage.googleapis.com`) enabled for your project.
@@ -43,119 +50,84 @@ Key functionalities include:
 ## Setup Instructions
 
 1.  **Clone the Repository:**
+    Clone the repository from the source. If you haven't already, navigate into the project directory:
     ```bash
-    git clone https://your-repository-url-here/project-name.git 
-    cd project-name
+    cd your-project-directory-name 
     ```
-    (Replace `https://your-repository-url-here/project-name.git` with the actual URL)
+    (Replace `your-project-directory-name` with the actual directory name).
 
 2.  **Install Dependencies:**
     ```bash
     npm install
     ```
-    Key dependencies include: `ari-client`, `google-auth-library`, `wavefile`, `winston`, `dotenv`, `async`, `chalk`, and `https`.
+    Key dependencies include: `ari-client`, `google-auth-library`, `wavefile`, `winston`, `dotenv`, `async`, `chalk`, `ws`, and `redis`. (Note: `https` is a built-in Node.js module).
 
 3.  **Google Cloud Setup:**
-    1.  **Create/Select Project:** Ensure you have a Google Cloud Project.
-    2.  **Enable Billing:** Verify that billing is enabled for your project.
-    3.  **Enable API:** In the Google Cloud Console, navigate to "APIs & Services" > "Library" and search for "Google Generative Language API". Enable it for your project.
-    4.  **Create Service Account & Key:**
-        *   Go to "IAM & Admin" > "Service Accounts".
-        *   Click "Create Service Account".
-        *   Provide a name (e.g., "gemini-asterisk-sa") and an optional description.
-        *   **Grant Permissions:** Assign roles that provide the necessary permissions. "Generative Language API User" is a good starting point. For more fine-grained control, ensure permissions like `generativelanguage.authTokens.create` and `generativelanguage.models.streamGenerateContent` are included.
-        *   Click "Done".
-        *   After creating the service account, find it in the list, click on it, go to the "Keys" tab.
-        *   Click "Add Key" > "Create new key".
-        *   Select "JSON" as the key type and click "Create".
-        *   A JSON key file will be downloaded. Securely store this file.
+    (As previously described - ensure API is enabled, service account created with correct permissions, and JSON key downloaded).
 
-4.  **Application Configuration:**
+4.  **Application Configuration (`.env` file):**
     *   Rename the `.env.example` file to `.env`:
         ```bash
         cp .env.example .env
         ```
     *   Edit the `.env` file and provide values for all required variables:
-        *   `ARI_URL`: URL for the Asterisk ARI (e.g., `http://localhost:8088`).
-        *   `ARI_USER`: ARI username.
-        *   `ARI_PASS`: ARI password.
-        *   `ARI_APP_NAME`: The Stasis application name (e.g., `gemini-rt-app`). This must match your Asterisk dialplan.
-        *   `RTP_SERVER_PORT`: The local UDP port where the application will listen for RTP audio from Asterisk (e.g., `12000`).
-        *   `GOOGLE_APPLICATION_CREDENTIALS`: The **absolute path** to the downloaded service account JSON key file.
-        *   `GEMINI_PROJECT_ID`: Your Google Cloud Project ID.
-        *   `GEMINI_MODEL_NAME`: (Optional) The Gemini model to use (defaults to `models/gemini-1.5-flash-001`).
-        *   `GEMINI_TARGET_INPUT_SAMPLE_RATE`: (Optional) Target sample rate for audio sent to Gemini (defaults to 16000).
-        *   `GEMINI_VAD_ENERGY_THRESHOLD`, `GEMINI_VAD_PREFIX_REQUIRED_DURATION_MS`, `GEMINI_VAD_ACTIVITY_RATIO_THRESHOLD`, `GEMINI_VAD_SUFFIX_REQUIRED_DURATION_MS`: VAD parameters for Gemini.
-        *   `LOG_LEVEL`: (Optional) Logging level (e.g., `info`, `debug`).
-        *   Other optional parameters as needed (e.g., `MAX_CALL_DURATION_S`, `ENABLE_AUDIO_RECORDING`).
+        *   **Asterisk & RTP**:
+            *   `ARI_URL`, `ARI_USER`, `ARI_PASS`, `ARI_APP_NAME`
+            *   `RTP_SERVER_PORT`, `RTP_SERVER_IP_FOR_ASTERISK` (optional)
+        *   **Google Cloud & Gemini**:
+            *   `GOOGLE_APPLICATION_CREDENTIALS`: The **absolute path** to the downloaded service account JSON key file.
+            *   `GEMINI_PROJECT_ID`: Your Google Cloud Project ID.
+            *   `GEMINI_MODEL_NAME`: (Optional) The Gemini model to use (defaults to `models/gemini-1.5-flash-001`).
+            *   `GEMINI_TARGET_INPUT_SAMPLE_RATE`: (Optional, default: 16000).
+            *   `GEMINI_SYSTEM_INSTRUCTION`: (Optional) Custom system prompt for Gemini. Defaults are in `prompts.js`.
+            *   VAD parameters: `GEMINI_VAD_ENERGY_THRESHOLD`, `GEMINI_VAD_PREFIX_PADDING_MS`, `GEMINI_VAD_END_SENSITIVITY`, `GEMINI_VAD_SILENCE_DURATION_MS`.
+        *   **Redis Configuration (for Conversation Memory)**:
+            *   `REDIS_HOST`: Hostname for the Redis server (default: `127.0.0.1`).
+            *   `REDIS_PORT`: Port for the Redis server (default: 6379).
+            *   `REDIS_PASSWORD`: Password for Redis authentication (optional, default: none).
+            *   `REDIS_DB`: Redis database number (optional, default: 0).
+            *   `REDIS_CONVERSATION_TTL_S`: Time-to-live for conversation history in Redis, in seconds (default: 86400).
+            *   `GEMINI_HISTORY_MAX_TURNS`: Maximum number of recent conversation turns (user + AI messages) to load from Redis for providing context to Gemini (default: 10).
+        *   **Other**:
+            *   `LOG_LEVEL`: (Optional, e.g., `info`, `debug`).
+            *   `MAX_CALL_DURATION_S`: (Optional, default: 300).
+            *   `ENABLE_AUDIO_RECORDING`: (Optional).
+    *   **System Prompts (`prompts.js`)**:
+        *   Review and customize default system prompts in `prompts.js`. Environment variables like `GEMINI_SYSTEM_INSTRUCTION` can override these.
 
 5.  **Asterisk Configuration:**
-    *   **Dialplan (`extensions.conf`):** Configure Asterisk to route calls to the Stasis application defined in `ARI_APP_NAME`.
-        Example:
-        ```
-        exten => _X.,1,NoOp(Call to Stasis application ${ARI_APP_NAME})
-           same => n,Stasis(${ARI_APP_NAME})
-           same => n,Hangup()
-        ```
-        Ensure your test extension or DID routes to a context that includes this.
-    *   **PJSIP/SIP (`pjsip.conf`):** Ensure you have a SIP peer configured for your softphone or test trunk.
-        (Refer to `pjsip.conf.sample` in the original repository for examples, if available, and adapt as needed.)
-    *   Ensure Asterisk is running and the ARI module is enabled and configured correctly in `ari.conf`.
+    (As previously described - dialplan, SIP peer, ARI enabled).
 
 ## Running the Application
 
-1.  Start the Node.js application:
+1.  Ensure your Redis server is running and accessible.
+2.  Start the Node.js application:
     ```bash
     node asterisk_to_gemini_rt.js
     ```
-2.  Make a call from your SIP client to an extension that routes to the Stasis application in your Asterisk dialplan.
+3.  Make a call from your SIP client to an extension that routes to the Stasis application in your Asterisk dialplan.
 
 ## How it Works (Brief Technical Flow)
 
-1.  The Node.js application connects to Asterisk via the Asterisk REST Interface (ARI).
-2.  When a call enters the specified Stasis application context in Asterisk, ARI sends a `StasisStart` event.
-3.  The application answers the call and creates an `ExternalMedia` channel. This directs Asterisk to send RTP audio (µ-law) from the caller to the Node.js application's specified UDP port (`RTP_PORT`) and receive RTP audio back from the application.
-4.  **Authentication:**
-    *   The application uses the provided service account credentials (`GOOGLE_APPLICATION_CREDENTIALS`) and `GoogleAuth` library to obtain an OAuth2 access token.
-    *   This access token is then used to request an ephemeral token from the Gemini `AuthTokenService.CreateToken` endpoint.
-5.  **Gemini Connection:**
-    *   The `GeminiApiCommunicator` establishes a WebSocket connection to the Gemini Live API using the ephemeral token.
-    *   It sends a configuration message including the desired model and VAD settings.
-6.  **Audio to Gemini:**
-    *   Incoming µ-law RTP audio from Asterisk is received by the Node.js application.
-    *   It's converted from µ-law to LPCM (8kHz), then upsampled to `GEMINI_TARGET_INPUT_SAMPLE_RATE` (e.g., 16kHz).
-    *   This LPCM audio is encoded into WAV format.
-    *   The raw WAV audio buffer is sent to Gemini via the WebSocket connection (the `GeminiApiCommunicator` handles internal Base64 encoding if needed by the underlying library).
-7.  **Audio and Transcriptions from Gemini:**
-    *   Gemini processes the audio and streams back:
-        *   Real-time audio responses (as 24kHz PCM).
-        *   Intermediate and final transcriptions of the user's speech.
-8.  **Audio to Asterisk:**
-    *   The 24kHz PCM audio from Gemini is received by the application.
-    *   It's converted to 8kHz LPCM and then to µ-law.
-    *   This µ-law audio is packetized into RTP and streamed back to the Asterisk ExternalMedia channel, which then plays it to the caller.
-9.  **Call Termination:** When the call ends or is hung up, resources (ARI channels, bridges, Gemini connection) are cleaned up.
+1.  ARI Connection: Application connects to Asterisk via ARI.
+2.  Call Handling: On `StasisStart`, an `ExternalMedia` channel is set up for RTP.
+3.  **Conversation History Loading**: The application attempts to load the last `GEMINI_HISTORY_MAX_TURNS` from Redis for the current `channelId`.
+4.  **Authentication & Gemini Connection**:
+    *   Obtains an ephemeral token for Gemini using service account credentials.
+    *   The `GeminiApiCommunicator` establishes a WebSocket connection.
+    *   The initial setup message to Gemini now includes the loaded conversation history and the system prompt from `prompts.js` (or environment variable) as `initialContents`.
+5.  **Audio to Gemini**: µ-law audio from Asterisk is converted to WAV and streamed to Gemini.
+6.  **Storing User Input**: When Gemini transcribes user speech (`onInputTranscription`), the text is saved to Redis with a timestamp and speaker "user".
+7.  **Audio and Transcriptions from Gemini**: Gemini streams back audio responses and transcriptions.
+8.  **Storing AI Response**: When Gemini provides its own transcription (`onOutputTranscription`), this text is saved to Redis with a timestamp and speaker "ai".
+9.  **Audio to Asterisk**: Gemini's audio response is converted back to µ-law and streamed to Asterisk via RTP.
+10. **Call Termination**: Resources are cleaned up. Conversation history in Redis expires based on TTL.
 
 ## Logging
-
-*   The application uses Winston for logging.
-*   Log level can be configured using the `LOG_LEVEL` environment variable (e.g., `info`, `debug`, `error`).
-*   Logs include information about call progression, ARI events, RTP handling, Gemini API communication, and errors.
+(As previously described).
 
 ## Troubleshooting (Optional)
-
-*   **Authentication Errors:**
-    *   Ensure `GOOGLE_APPLICATION_CREDENTIALS` points to the correct, valid service account JSON key file.
-    *   Verify the service account has the necessary IAM permissions for the Generative Language API (e.g., "Generative Language API User" or roles with `generativelanguage.authTokens.create` and `generativelanguage.models.streamGenerateContent`).
-    *   Check that the Google Generative Language API is enabled in your Cloud Project and that billing is active.
-*   **Asterisk Connection Issues:**
-    *   Verify ARI is enabled and configured in Asterisk (`ari.conf`).
-    *   Ensure `ARI_URL`, `ARI_USER`, and `ARI_PASS` in `.env` are correct.
-    *   Check Asterisk logs for ARI connection errors.
-*   **No Audio / One-Way Audio:**
-    *   Verify RTP port settings (`RTP_PORT` in `.env`) and any firewall configurations between Asterisk and the Node.js application.
-    *   Ensure `rtpServerIp` in `asterisk_to_gemini_rt.js` (if hardcoded or dynamically determined) is reachable by Asterisk for sending RTP audio back.
-    *   Check Asterisk console for RTP errors.
-*   **"File already exists" errors during development:** This can happen if the `create_file_with_block` tool is used multiple times with the same filename. Use `overwrite_file_with_block` if you intend to replace an existing file.
+(As previously described, consider adding notes for Redis connection issues if they become common).
 
 This README should provide a good starting point for users of the `asterisk_to_gemini_rt.js` application.
+[end of README_gemini.md]
